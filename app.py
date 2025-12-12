@@ -17,17 +17,24 @@ import pandas as pd
 # -----------------------------
 load_dotenv()
 
-SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-SEARCH_API_KEY = os.getenv("AZURE_SEARCH_API_KEY")
-SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX")
+def get_secret(name, default=None):
+    """Load variable from st.secrets if present, else from environment."""
+    if name in st.secrets:
+        return st.secrets[name]
+    return os.getenv(name, default)
 
-CONTENT_FIELD = os.getenv("AZURE_SEARCH_CONTENT_FIELD", "content")
-VECTOR_FIELD = os.getenv("AZURE_SEARCH_VECTOR_FIELD", "contentVector")
+SEARCH_ENDPOINT = get_secret("AZURE_SEARCH_ENDPOINT")
+SEARCH_API_KEY = get_secret("AZURE_SEARCH_API_KEY")
+SEARCH_INDEX = get_secret("AZURE_SEARCH_INDEX")
 
-OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-EMBED_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+CONTENT_FIELD = get_secret("AZURE_SEARCH_CONTENT_FIELD", "content")
+VECTOR_FIELD = get_secret("AZURE_SEARCH_VECTOR_FIELD", "contentVector")
+
+OPENAI_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT")
+OPENAI_API_KEY = get_secret("AZURE_OPENAI_API_KEY")
+OPENAI_DEPLOYMENT = get_secret("AZURE_OPENAI_DEPLOYMENT")
+EMBED_DEPLOYMENT = get_secret("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+
 
 if not all(
     [
