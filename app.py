@@ -1,7 +1,5 @@
 import os
-import base64
 import re
-from urllib.parse import urlparse, unquote
 from datetime import datetime
 
 import streamlit as st
@@ -18,23 +16,24 @@ import pandas as pd
 load_dotenv()
 
 def get_secret(name, default=None):
-    """Load variable from st.secrets if present, else from environment."""
-    if name in st.secrets:
-        return st.secrets[name]
-    return os.getenv(name, default)
+    try:
+        return st.secrets.get(name, os.getenv(name, default))
+    except Exception:
+        return os.getenv(name, default)
 
 SEARCH_ENDPOINT = get_secret("AZURE_SEARCH_ENDPOINT")
 SEARCH_API_KEY = get_secret("AZURE_SEARCH_API_KEY")
 SEARCH_INDEX = get_secret("AZURE_SEARCH_INDEX")
 
-CONTENT_FIELD = get_secret("AZURE_SEARCH_CONTENT_FIELD", "content")
-VECTOR_FIELD = get_secret("AZURE_SEARCH_VECTOR_FIELD", "contentVector")
+CONTENT_FIELD = get_secret("AZURE_SEARCH_CONTENT_FIELD", "chunk")
+VECTOR_FIELD = get_secret("AZURE_SEARCH_VECTOR_FIELD", "text_vector")
 
 OPENAI_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT")
 OPENAI_API_KEY = get_secret("AZURE_OPENAI_API_KEY")
 OPENAI_DEPLOYMENT = get_secret("AZURE_OPENAI_DEPLOYMENT")
 EMBED_DEPLOYMENT = get_secret("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
+EXPECTED_EMBED_DIM = 3072  # matches your index text_vector.dimensions
 
 if not all(
     [
@@ -64,64 +63,33 @@ client = AzureOpenAI(
 )
 
 # -----------------------------
-# Helpers (your original logic)
+# Helpers
 # -----------------------------
 def embed_text(text: str):
     resp = client.embeddings.create(
         model=EMBED_DEPLOYMENT,
         input=[text],
     )
-    return resp.data[0].embedding
+    vec = resp.data[0].embedding
+
+    # Guardrail: vector field expects 3072 dims now
+    if len(vec) != EXPECTED_EMBED_DIM:
+        raise ValueError(
+            f"Embedding dim mismatch: got {len(vec)}, expected {EXPECTED_EMBED_DIM}. "
+            "Check AZURE_OPENAI_EMBEDDING_DEPLOYMENT and the index vector field dimensions."
+        )
+
+    return vec
 
 
-def _decode_base64_url(b64_str: str):
-    if not b64_str:
-        return None, None
-
-    padding = "=" * (-len(b64_str) % 4)
-    candidate = b64_str + padding
-
-    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
-        try:
-            url = decoder(candidate.encode("utf-8")).decode("utf-8")
-            parsed = urlparse(url)
-            filename = unquote(parsed.path.split("/")[-1]) if parsed.path else None
-            return url, filename
-        except Exception:
-            continue
-
-    return None, None
-
-
-def decode_text_document_id(text_doc_id: str):
-    if not text_doc_id:
-        return None, None
-    return _decode_base64_url(text_doc_id)
-
-
-def decode_from_content_id(content_id: str):
-    if not content_id:
-        return None, None
-
-    base = content_id
-
-    if "_pages_" in base:
-        base = base.rsplit("_pages_", 1)[0]
-
-    parts = base.split("_", 1)
-    if len(parts) < 2:
-        return None, None
-
-    b64_str = parts[1]
-    b64_str = re.sub(r"\d+$", "", b64_str)
-
-    return _decode_base64_url(b64_str)
-
-
-def extract_page_from_content_id(content_id: str):
-    if not content_id:
+def extract_page_from_chunk_id(chunk_id: str):
+    """
+    Optional: only works if chunk_id contains a suffix like _pages_12
+    (your new pipeline may or may not include this).
+    """
+    if not chunk_id:
         return None
-    m = re.search(r"_pages_(\d+)$", content_id)
+    m = re.search(r"_pages_(\d+)$", chunk_id)
     return int(m.group(1)) if m else None
 
 
@@ -134,51 +102,39 @@ def retrieve_docs(question: str, k: int = 5, use_hybrid: bool = True):
         fields=VECTOR_FIELD,
     )
 
+    # Select only fields that exist in your new index schema
     results = search_client.search(
-        search_text=question if use_hybrid else None,
-        vector_queries=[vq],
+        search_text=question,  # always set for semantic
+        vector_queries=[vq] if use_hybrid else None,
         top=k,
+        query_type="semantic",
+        semantic_configuration_name="maca-large-rag-1765859572456-semantic-configuration",
+        select=[
+            "chunk_id", "parent_id", "chunk", "title", "source_url",
+            "header_1", "header_2", "header_3",
+        ],
     )
 
     docs = []
     for r in results:
         row = dict(r)
 
+        chunk_id = row.get("chunk_id")
+        parent_id = row.get("parent_id")
+
         content = row.get(CONTENT_FIELD, "") or ""
-        content_id = row.get("content_id")
-        text_doc_id = row.get("text_document_id")
-        page = extract_page_from_content_id(content_id)
+        page = extract_page_from_chunk_id(chunk_id)
 
-        doc_url = None
-        doc_name = None
-
-        title = row.get("document_title")
-        if title:
-            doc_name = title
-
-        if not doc_name and text_doc_id:
-            url, filename = decode_text_document_id(text_doc_id)
-            if filename:
-                doc_name = filename
-            if url:
-                doc_url = url
-
-        if not doc_name and content_id:
-            url2, filename2 = decode_from_content_id(content_id)
-            if filename2:
-                doc_name = filename2
-            if url2 and not doc_url:
-                doc_url = url2
-
-        if not doc_name:
-            doc_name = row.get("content_id") or "Unknown document"
+        # New schema: use title + source_url directly
+        doc_name = row.get("title") or parent_id or chunk_id or "Unknown document"
+        doc_url = row.get("source_url")
 
         docs.append(
             {
                 "content": content,
-                "source_id": content_id,
-                "doc_url": doc_url,
-                "doc_name": doc_name,
+                "source_id": chunk_id,     # key in your index
+                "doc_url": doc_url,        # now comes from source_url
+                "doc_name": doc_name,      # now comes from title
                 "page": page,
                 "score": row.get("@search.score"),
             }
@@ -241,6 +197,7 @@ def answer_with_rag(
         "Do NOT invent new procedures, policies, or safety guidance. "
         "If the question appears to ask for judgement outside the documentation (e.g., priority rules, shortcuts, "
         "permissions, or safety critical decisions), clearly state that this must be referred to a supervisor or HSE."
+        "If the provided documentation appears to contain only a table of contents or headings for a section, and not the clause text itself, explicitly state this and request additional relevant chunks instead of concluding the section has no content"
     )
 
     system_prompt = system_prompt_override.strip() if system_prompt_override else default_system_prompt
@@ -254,7 +211,7 @@ def answer_with_rag(
 
     messages = [
         {"role": "system", "content": system_prompt},
-        *chat_history,  # <-- keeps conversational awareness
+        *chat_history,
         {"role": "user", "content": user_prompt},
     ]
 
@@ -273,8 +230,8 @@ def answer_with_rag(
 
 def is_human_readable_source(doc_name: str):
     """
-    Filter out ugly IDs like fb024fccaa92_aHR0cHM6Ly9...
-    We keep sources that look like normal filenames or titles.
+    With the new index, doc_name should usually be the filename from metadata_storage_name,
+    so this filter is generally fine to keep.
     """
     if not doc_name:
         return False
@@ -290,11 +247,10 @@ def is_human_readable_source(doc_name: str):
 # -----------------------------
 st.set_page_config(page_title="MACA & Thiess Worker Support Agent (POC)", layout="wide")
 
-# Session state init
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []   # list of {"role": "...", "content": "..."}
+    st.session_state.chat_history = []
 if "messages_for_ui" not in st.session_state:
-    st.session_state.messages_for_ui = []  # list of (role, text, sources)
+    st.session_state.messages_for_ui = []
 if "system_prompt_override" not in st.session_state:
     st.session_state.system_prompt_override = None
 if "k" not in st.session_state:
@@ -302,20 +258,19 @@ if "k" not in st.session_state:
 if "max_chars" not in st.session_state:
     st.session_state.max_chars = 4000
 if "search_logs" not in st.session_state:
-    st.session_state.search_logs = []  # list of dicts per query
+    st.session_state.search_logs = []
 
 DEFAULT_PROMPT = (
     "You are an internal support assistant for MACA frontline workers."
     "Use ONLY the provided documentation (labelled [Source: ...]) to answer questions."
     "If the answer is not explicitly contained in the documentation, or contained within the appendix of the document, say you do not know the answer and advise the user to refer to their supervisor, HSE, or the relevant operating procedure."
-    "Do NOT invent new procedures, policies, or safety guidance. If the question appears to ask for judgement outside the documentation (e.g., priority rules, shortcuts, permissions, or safety critical decisions), clearly state that this must be referred to a supervisor or HSE." 
+    "Do NOT invent new procedures, policies, or safety guidance. If the question appears to ask for judgement outside the documentation (e.g., priority rules, shortcuts, permissions, or safety critical decisions), clearly state that this must be referred to a supervisor or HSE."
     "Answer as thoroughly as possible using the main document content, images, and data in the appendix to prevent the user needing to make follow up requests to obtain the answer that they seek. "
     "For follow-up questions, assume context from earlier user questions and previous answers unless the user clearly indicates a new topic"
     "When the user asks a high-level conceptual question (e.g. 'Who has right of way?'), search for related procedures even if specific vehicle combinations are not mentioned"
     "If the documents imply the answer but do not explicitly state it, summarise what is relevant and explain limitations."
 )
 
-# Sidebar navigation
 with st.sidebar:
     st.title("MACA POC")
     page = st.radio("Go to", ["Chat", "Settings", "Search log"], index=0)
@@ -327,7 +282,6 @@ if page == "Chat":
     st.title("MACA and Thiess Frontline Worker Support (POC)")
     st.caption("Ask questions about mining SOPs / terminology / technology etc. Answers are grounded in indexed documents.")
 
-    # Render chat so far
     for role, text, sources in st.session_state.messages_for_ui:
         with st.chat_message(role):
             st.markdown(text)
@@ -345,7 +299,6 @@ if page == "Chat":
                         else:
                             st.markdown(f"- **{label}** (score: {score:.4f})")
 
-    # Chat input
     question = st.chat_input("Ask a question about MACA SOPs, mine operations, or terminology...")
 
     if question:
@@ -362,25 +315,21 @@ if page == "Chat":
                     max_chars=st.session_state.max_chars,
                 )
 
-                # filter sources for display
                 docs_used_filtered = [
                     d for d in docs_used if is_human_readable_source(d.get("doc_name"))
                 ]
 
                 st.markdown(answer)
 
-        # persist chat history and messages for UI
         st.session_state.chat_history = new_history
         st.session_state.messages_for_ui.append(("user", question, None))
         st.session_state.messages_for_ui.append(("assistant", answer, docs_used_filtered))
 
-        # determine if an answer was actually given (vs fallback)
         fallback_prefix = "I couldn't find anything in the documentation for that question."
         answered = not answer.startswith(fallback_prefix)
 
         top_source_name = docs_used_filtered[0]["doc_name"] if docs_used_filtered else None
 
-        # log the search (in-memory only)
         st.session_state.search_logs.append(
             {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -409,14 +358,14 @@ elif page == "Settings":
     st.session_state.k = st.slider(
         "Number of sources (k)",
         min_value=1,
-        max_value=10,
+        max_value=15,
         value=st.session_state.k,
     )
 
     st.session_state.max_chars = st.slider(
         "Max context characters",
         1000,
-        8000,
+        12000,
         st.session_state.max_chars,
         step=500,
     )
