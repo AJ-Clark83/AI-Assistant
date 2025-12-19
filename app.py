@@ -9,6 +9,7 @@ from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.models import VectorizedQuery
 import pandas as pd
+import hmac
 
 # -----------------------------
 # Config / Environment
@@ -20,6 +21,37 @@ def get_secret(name, default=None):
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
         return os.getenv(name, default)
+
+APP_PASSWORD = get_secret("APP_PASSWORD")
+
+def require_password():
+    if not APP_PASSWORD:
+        st.error("APP_PASSWORD is not set in secrets or environment.")
+        st.stop()
+
+    # Persist auth across reruns
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+
+    if st.session_state.auth_ok:
+        return
+
+    st.title("MACA POC")
+    st.caption("Enter password to continue")
+
+    pw = st.text_input("Password", type="password")
+
+    if st.button("Unlock"):
+        # Use constant-time compare
+        if hmac.compare_digest(pw, APP_PASSWORD):
+            st.session_state.auth_ok = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+
+    st.stop()
+
+require_password()
 
 SEARCH_ENDPOINT = get_secret("AZURE_SEARCH_ENDPOINT")
 SEARCH_API_KEY = get_secret("AZURE_SEARCH_API_KEY")
