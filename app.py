@@ -60,12 +60,21 @@ SEARCH_INDEX = get_secret("AZURE_SEARCH_INDEX")
 CONTENT_FIELD = get_secret("AZURE_SEARCH_CONTENT_FIELD", "chunk")
 VECTOR_FIELD = get_secret("AZURE_SEARCH_VECTOR_FIELD", "text_vector")
 
+# NEW (recommended): semantic config name (matches what you use in Search Explorer)
+SEMANTIC_CONFIG = get_secret(
+    "AZURE_SEARCH_SEMANTIC_CONFIG",
+    "maca-large-rag-1765859572456-semantic-configuration"
+)
+
 OPENAI_ENDPOINT = get_secret("AZURE_OPENAI_ENDPOINT")
 OPENAI_API_KEY = get_secret("AZURE_OPENAI_API_KEY")
 OPENAI_DEPLOYMENT = get_secret("AZURE_OPENAI_DEPLOYMENT")
 EMBED_DEPLOYMENT = get_secret("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
 EXPECTED_EMBED_DIM = 3072  # matches your index text_vector.dimensions
+
+# NEW (recommended): default max chars set via secrets
+DEFAULT_MAX_CHARS = int(get_secret("AZURE_SEARCH_DEFAULT_MAX_CHARS", "12000"))
 
 if not all(
     [
@@ -140,7 +149,10 @@ def retrieve_docs(question: str, k: int = 5, use_hybrid: bool = True):
         vector_queries=[vq] if use_hybrid else None,
         top=k,
         query_type="semantic",
-        semantic_configuration_name="maca-large-rag-1765859572456-semantic-configuration",
+        semantic_configuration_name=SEMANTIC_CONFIG,
+        # NEW (recommended): match Portal settings more closely
+        query_caption="extractive",
+        query_answer="extractive|count-3",
         select=[
             "chunk_id", "parent_id", "chunk", "title", "source_url",
             "header_1", "header_2", "header_3",
@@ -175,12 +187,13 @@ def retrieve_docs(question: str, k: int = 5, use_hybrid: bool = True):
     return docs
 
 
-def build_context(docs, max_chars: int = 4000):
+# NEW (critical fix): never return empty context just because the first chunk is too large
+def build_context(docs, max_chars: int = 12000):
     pieces = []
     total = 0
 
     for d in docs:
-        text = d["content"]
+        text = (d.get("content") or "").strip()
         if not text:
             continue
 
@@ -189,12 +202,23 @@ def build_context(docs, max_chars: int = 4000):
         if page is not None:
             label = f"{label}, page {page}"
 
-        block = f"[Source: {label}]\n{text.strip()}\n"
-        if total + len(block) > max_chars:
+        header = f"[Source: {label}]\n"
+        footer = "\n"
+
+        remaining = max_chars - total
+        if remaining <= len(header) + len(footer):
             break
+
+        max_text_len = remaining - len(header) - len(footer)
+        snippet = text[:max_text_len]  # truncate if needed
+
+        block = f"{header}{snippet}{footer}"
 
         pieces.append(block)
         total += len(block)
+
+        if total >= max_chars:
+            break
 
     return "\n\n---\n\n".join(pieces)
 
@@ -204,7 +228,7 @@ def answer_with_rag(
     chat_history=None,
     k: int = 5,
     system_prompt_override: str = None,
-    max_chars: int = 4000,
+    max_chars: int = 12000,
 ):
     if chat_history is None:
         chat_history = []
@@ -228,8 +252,10 @@ def answer_with_rag(
         "and advise the user to refer to their supervisor, HSE, or the relevant operating procedure. "
         "Do NOT invent new procedures, policies, or safety guidance. "
         "If the question appears to ask for judgement outside the documentation (e.g., priority rules, shortcuts, "
-        "permissions, or safety critical decisions), clearly state that this must be referred to a supervisor or HSE."
-        "If the provided documentation appears to contain only a table of contents or headings for a section, and not the clause text itself, explicitly state this and request additional relevant chunks instead of concluding the section has no content"
+        "permissions, or safety critical decisions), clearly state that this must be referred to a supervisor or HSE. "
+        "If the provided documentation appears to contain only a table of contents or headings for a section, and not "
+        "the clause text itself, explicitly state this and request additional relevant chunks instead of concluding "
+        "the section has no content."
     )
 
     system_prompt = system_prompt_override.strip() if system_prompt_override else default_system_prompt
@@ -288,18 +314,24 @@ if "system_prompt_override" not in st.session_state:
 if "k" not in st.session_state:
     st.session_state.k = 5
 if "max_chars" not in st.session_state:
-    st.session_state.max_chars = 4000
+    # NEW: default big enough to fit at least one 7k chunk
+    st.session_state.max_chars = DEFAULT_MAX_CHARS
 if "search_logs" not in st.session_state:
     st.session_state.search_logs = []
 
 DEFAULT_PROMPT = (
-    "You are an internal support assistant for MACA frontline workers."
-    "Use ONLY the provided documentation (labelled [Source: ...]) to answer questions."
-    "If the answer is not explicitly contained in the documentation, or contained within the appendix of the document, say you do not know the answer and advise the user to refer to their supervisor, HSE, or the relevant operating procedure."
-    "Do NOT invent new procedures, policies, or safety guidance. If the question appears to ask for judgement outside the documentation (e.g., priority rules, shortcuts, permissions, or safety critical decisions), clearly state that this must be referred to a supervisor or HSE."
-    "Answer as thoroughly as possible using the main document content, images, and data in the appendix to prevent the user needing to make follow up requests to obtain the answer that they seek. "
-    "For follow-up questions, assume context from earlier user questions and previous answers unless the user clearly indicates a new topic"
-    "When the user asks a high-level conceptual question (e.g. 'Who has right of way?'), search for related procedures even if specific vehicle combinations are not mentioned"
+    "You are an internal support assistant for MACA frontline workers. "
+    "Use ONLY the provided documentation (labelled [Source: ...]) to answer questions. "
+    "If the answer is not explicitly contained in the documentation, or contained within the appendix of the document, "
+    "say you do not know the answer and advise the user to refer to their supervisor, HSE, or the relevant operating procedure. "
+    "Do NOT invent new procedures, policies, or safety guidance. "
+    "If the question appears to ask for judgement outside the documentation (e.g., priority rules, shortcuts, permissions, "
+    "or safety critical decisions), clearly state that this must be referred to a supervisor or HSE. "
+    "Answer as thoroughly as possible using the main document content, images, and data in the appendix to prevent the user "
+    "needing to make follow up requests to obtain the answer that they seek. "
+    "For follow-up questions, assume context from earlier user questions and previous answers unless the user clearly indicates a new topic. "
+    "When the user asks a high-level conceptual question (e.g. 'Who has right of way?'), search for related procedures even if specific vehicle "
+    "combinations are not mentioned. "
     "If the documents imply the answer but do not explicitly state it, summarise what is relevant and explain limitations."
 )
 
